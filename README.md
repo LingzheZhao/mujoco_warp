@@ -5,6 +5,13 @@
 
 # MuJoCo Warp (MJWarp)
 
+This is the NablaMimic analytic-adjoint integration branch of the LingzheZhao
+fork. Use the pinned installation and source history in [NABLAMIMIC.md](NABLAMIMIC.md).
+The package is source-equivalent to the previously validated five-patch SDK;
+this is not a wholesale upgrade to current official main. The official badges,
+examples and general upstream instructions below describe upstream MJWarp.
+For this branch, use the pinned fork installation instead of the PyPI command.
+
 MJWarp is a GPU-accelerated version of the [MuJoCo](https://github.com/google-deepmind/mujoco) physics simulator, designed for NVIDIA hardware. MJWarp delivers high-throughput, accurate simulation for robotics research.
 
 MJWarp is maintained by [Google DeepMind](https://deepmind.google/) and [NVIDIA](https://www.nvidia.com/) as part of the [Newton](https://github.com/newton-physics/newton) project.
@@ -122,7 +129,7 @@ MuJoCo Warp supports the same features as MuJoCo with the following exceptions:
 - **Actuator / Sensors**: `PLUGIN` types not yet supported
 - **Flex**: experimental — not all features are implemented or optimized yet
 
-[Differentiability via Warp](https://nvidia.github.io/warp/user_guide/differentiability.html) is not yet available. See [#500](https://github.com/google-deepmind/mujoco_warp/issues/500) for progress.
+The upstream differentiability status is tracked in [#500](https://github.com/google-deepmind/mujoco_warp/issues/500). This integration branch includes the analytic-adjoint implementation described in [NABLAMIMIC.md](NABLAMIMIC.md); it is not an official differentiability release.
 
 # Batch Rendering
 
