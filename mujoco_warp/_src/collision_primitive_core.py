@@ -12,7 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
+# Modified from the original MuJoCo Warp source: backward-pass switches read from MJW_* environment variables at
+# import (patches 0001-0004, see their README); the forward is unchanged.
 
+import os
 from typing import Tuple
 
 import warp as wp
@@ -23,6 +26,35 @@ from mujoco_warp._src.math import normalize_with_norm
 from mujoco_warp._src.math import safe_div
 from mujoco_warp._src.types import MJ_MAXVAL
 from mujoco_warp._src.types import MJ_MINVAL
+
+# Switch of patch 0001 (the fused engine's convention): how the backward differentiates the normal
+# n = v / |v| of sphere-sphere, sphere-capsule and capsule-capsule contacts (all built by sphere_sphere), whose derivative
+# (I - n n') / |v| diverges as the two centres / axes meet. Read at import: MJW_ADJ_NORMAL = 0 exact (MuJoCo Warp), 1 n
+# constant, 2 (I - n n') / max(|v|, eps), 3 n constant where |v| < eps; MJW_ADJ_NORMAL_EPS = eps in m (default 1e-3).
+# The forward is the same in every mode.
+ADJ_NORMAL = wp.constant(int(os.environ.get("MJW_ADJ_NORMAL", "0")))
+ADJ_NORMAL_EPS = wp.constant(float(os.environ.get("MJW_ADJ_NORMAL_EPS", "1e-3")))
+
+
+@wp.func
+def _contact_normal(dir: wp.vec3, length: float) -> wp.vec3:
+  return dir / length
+
+
+@wp.func_grad(_contact_normal)
+def _adj_contact_normal(dir: wp.vec3, length: float, adj_ret: wp.vec3):
+  # exact: the adjoint of dir / length through both arguments (length = |dir| carries the radial part)
+  scale = 1.0
+  if ADJ_NORMAL == 1:
+    scale = 0.0
+  elif ADJ_NORMAL == 2:
+    scale = length / wp.max(length, ADJ_NORMAL_EPS)
+  elif ADJ_NORMAL == 3:
+    if length < ADJ_NORMAL_EPS:
+      scale = 0.0
+  if scale != 0.0:
+    wp.adjoint[dir] += adj_ret * (scale / length)
+    wp.adjoint[length] += -scale * wp.dot(adj_ret, dir) / (length * length)
 
 wp.set_module_options({"enable_backward": False})
 
@@ -78,7 +110,7 @@ def sphere_sphere(
   if dist == 0.0:
     n = wp.vec3(1.0, 0.0, 0.0)
   else:
-    n = dir / dist
+    n = _contact_normal(dir, dist)  # dir / dist; backward per ADJ_NORMAL
   dist = dist - (radius1 + radius2)
   pos = pos1 + n * (radius1 + 0.5 * dist)
   return dist, pos, n

@@ -12,9 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
+# Modified from the original MuJoCo Warp source: backward-pass switches read from MJW_* environment variables at
+# import (patches 0001-0004, see their README); the forward is unchanged.
 """VJPs for time integration, smooth dynamics, and forward kinematics."""
 
 import dataclasses
+import os
 
 import warp as wp
 
@@ -28,6 +31,10 @@ from mujoco_warp._src import support
 from mujoco_warp._src import util_misc
 from mujoco_warp._src.types import BackwardContext
 from mujoco_warp._src.types import Data
+
+# Switch of patch 0001: MJW_CLAMP_KV_FIX=1 at import drops the actuator damping of clamped dofs from the qvel VJP
+# (clamped_actuator_qvel_backward); unset keeps the original behaviour.
+CLAMP_KV_FIX = os.environ.get("MJW_CLAMP_KV_FIX", "0") == "1"
 from mujoco_warp._src.types import DisableBit
 from mujoco_warp._src.types import IntegratorType
 from mujoco_warp._src.types import JointType
@@ -157,6 +164,55 @@ def _actuator_lam(
     if qfrc <= frcrange[0] or qfrc >= frcrange[1]:
       value = 0.0
   lam_out[worldid, dofid] = value
+
+
+@wp.kernel(enable_backward=False)
+def _clamped_actuator_qvel_vjp(
+  # Model:
+  actuator_biasprm: wp.array2d[vec10],
+  # Data in:
+  moment_rownnz_in: wp.array2d[int],
+  moment_rowadr_in: wp.array2d[int],
+  moment_colind_in: wp.array2d[int],
+  actuator_moment_in: wp.array2d[float],
+  # In:
+  lam: wp.array2d[float],
+  lam_masked: wp.array2d[float],
+  # Out:
+  adj_qvel_out: wp.array2d[float],
+):
+  """Removes the actuator velocity term of clamped dofs from the qvel VJP.
+
+  _smooth_qvel_vjp applies qDeriv, which keeps the affine bias's velocity coefficient (biasprm[2], -kv for a position
+  actuator) also where the joint actuator force is clamped by actuatorfrcrange, as the implicitfast matrix does. A clamped
+  force does not depend on qvel, so its part of the VJP, moment_a b2_a (moment_a . mu) with mu = lam - lam_masked (the
+  multiplier on the clamped dofs), is subtracted here.
+  """
+  worldid, actuatorid = wp.tid()
+  rowadr = moment_rowadr_in[worldid, actuatorid]
+  rownnz = moment_rownnz_in[worldid, actuatorid]
+  mu = smooth_adjoint._actuator_moment_dot(moment_colind_in, actuator_moment_in, lam, worldid, rowadr, rownnz)
+  mu -= smooth_adjoint._actuator_moment_dot(moment_colind_in, actuator_moment_in, lam_masked, worldid, rowadr, rownnz)
+  if mu == 0.0:
+    return
+  b2 = actuator_biasprm[worldid % actuator_biasprm.shape[0], actuatorid][2]
+  for i in range(rownnz):
+    elemid = rowadr + i
+    wp.atomic_add(adj_qvel_out[worldid], moment_colind_in[worldid, elemid], -b2 * actuator_moment_in[worldid, elemid] * mu)
+
+
+def clamped_actuator_qvel_backward(m: Model, d_out: Data, lam: wp.array, adj_qvel: wp.array, bc: BackwardContext):
+  """Call after _smooth_qvel_vjp: drops the actuator damping of clamped dofs from adj_qvel (see the kernel)."""
+  if not m.nu:
+    return
+  lam_masked = actuator_lam(m, d_out, lam, bc)
+  wp.launch(
+    _clamped_actuator_qvel_vjp,
+    dim=(d_out.nworld, m.nu),
+    inputs=[m.actuator_biasprm, d_out.moment_rownnz, d_out.moment_rowadr, d_out.moment_colind, d_out.actuator_moment, lam,
+            lam_masked],
+    outputs=[adj_qvel],
+  )
 
 
 def actuator_lam(m: Model, d_out: Data, lam: wp.array, bc: BackwardContext) -> wp.array:
@@ -361,6 +417,8 @@ def smooth_qvel_backward(m: Model, d: Data, d_out: Data, lam: wp.array, adj_qvel
     inputs=[m.opt.timestep, m.qD_fullm_i, m.qD_fullm_j, bc.qLU, bc.M_D, lam],
     outputs=[adj_qvel],
   )
+  if CLAMP_KV_FIX:
+    clamped_actuator_qvel_backward(m, d_out, lam, adj_qvel, bc)
   if m.nu and d.ctrl.requires_grad:
     wp.launch(
       _smooth_ctrl_vjp,
