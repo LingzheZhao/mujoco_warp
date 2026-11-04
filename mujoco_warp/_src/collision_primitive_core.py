@@ -12,7 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
+# Modified from the original MuJoCo Warp source: backward-pass switches read from MJW_* environment variables at
+# import (patches 0001-0004, see their README); the forward is unchanged.
 
+import os
 from typing import Tuple
 
 import warp as wp
@@ -23,6 +26,61 @@ from mujoco_warp._src.math import normalize_with_norm
 from mujoco_warp._src.math import safe_div
 from mujoco_warp._src.types import MJ_MAXVAL
 from mujoco_warp._src.types import MJ_MINVAL
+
+# Switch of patch 0001 (the fused engine's convention): how the backward differentiates the normal
+# n = v / |v| of sphere-sphere, sphere-capsule and capsule-capsule contacts (all built by sphere_sphere), whose derivative
+# (I - n n') / |v| diverges as the two centres / axes meet. Read at import: MJW_ADJ_NORMAL = 0 exact (MuJoCo Warp), 1 n
+# constant, 2 (I - n n') / max(|v|, eps), 3 n constant where |v| < eps; MJW_ADJ_NORMAL_EPS = eps in m (default 1e-3).
+# The forward is the same in every mode.
+ADJ_NORMAL = wp.constant(int(os.environ.get("MJW_ADJ_NORMAL", "0")))
+ADJ_NORMAL_EPS = wp.constant(float(os.environ.get("MJW_ADJ_NORMAL_EPS", "1e-3")))
+
+
+@wp.func
+def _contact_normal(dir: wp.vec3, length: float) -> wp.vec3:
+  return dir / length
+
+
+@wp.func_grad(_contact_normal)
+def _adj_contact_normal(dir: wp.vec3, length: float, adj_ret: wp.vec3):
+  # exact: the adjoint of dir / length through both arguments (length = |dir| carries the radial part)
+  scale = 1.0
+  if ADJ_NORMAL == 1:
+    scale = 0.0
+  elif ADJ_NORMAL == 2:
+    scale = length / wp.max(length, ADJ_NORMAL_EPS)
+  elif ADJ_NORMAL == 3:
+    if length < ADJ_NORMAL_EPS:
+      scale = 0.0
+  if scale != 0.0:
+    wp.adjoint[dir] += adj_ret * (scale / length)
+    wp.adjoint[length] += -scale * wp.dot(adj_ret, dir) / (length * length)
+
+
+# Switch of patch 0002 (the fused engine's convention): how the backward
+# differentiates the segment parameters x1, x2 of a capsule-capsule contact whose closest points both lie inside the
+# segments (no clamp) when the axes are nearly parallel. There the closest points slide along the axes with derivatives
+# of order |dif| / sin^2(theta) (a tilt of one axis), the normal turns with 1 / sin(theta), and the backward's
+# 1 / det (det = ma mc - mb^2 ~ sin^2(theta)) gives gradients of that size (about 0.1 / sin^2 times the cotangent per
+# control step on the G1's feet), which in a BPTT window push the cotangent past what the IFT solve takes (NaN).
+# Read at import: MJW_ADJ_PARALLEL = 0 exact (MuJoCo Warp), 1 x1, x2 held constant in the backward where both are
+# free and sin^2(theta) = |axis1 x axis2|^2 / (|axis1|^2 |axis2|^2) < MJW_ADJ_PARALLEL_EPS (default 1.2e-3, about
+# sin^2(2 degrees)); the contact then moves with the two material points, the distance's derivative is unchanged
+# (envelope theorem). The forward is the same in every mode.
+ADJ_PARALLEL = wp.constant(int(os.environ.get("MJW_ADJ_PARALLEL", "0")))
+ADJ_PARALLEL_EPS = wp.constant(float(os.environ.get("MJW_ADJ_PARALLEL_EPS", "1.2e-3")))
+
+
+@wp.func
+def _segment_param(x: float, frozen: int) -> float:
+  return x
+
+
+@wp.func_grad(_segment_param)
+def _adj_segment_param(x: float, frozen: int, adj_ret: float):
+  # exact: the identity's adjoint; frozen: none (x is a constant of the backward)
+  if frozen == 0:
+    wp.adjoint[x] += adj_ret
 
 wp.set_module_options({"enable_backward": False})
 
@@ -78,7 +136,7 @@ def sphere_sphere(
   if dist == 0.0:
     n = wp.vec3(1.0, 0.0, 0.0)
   else:
-    n = dir / dist
+    n = _contact_normal(dir, dist)  # dir / dist; backward per ADJ_NORMAL
   dist = dist - (radius1 + radius2)
   pos = pos1 + n * (radius1 + 0.5 * dist)
   return dist, pos, n
@@ -173,6 +231,13 @@ def capsule_capsule(
     x1 = (mc * u - mb * v) * inv_det
     x2 = (ma * v - mb * u) * inv_det
 
+    # patch 0002: near parallel with both parameters free (the clamps below leave them as they are)
+    frozen = int(0)
+    if ADJ_PARALLEL == 1:
+      if x1 >= -1.0 and x1 <= 1.0 and x2 >= -1.0 and x2 <= 1.0:
+        if wp.length_sq(wp.cross(axis1, axis2)) < ADJ_PARALLEL_EPS * ma * mc:
+          frozen = 1
+
     if x1 > 1.0:
       x1 = 1.0
       x2 = (v - mb) / mc
@@ -186,6 +251,10 @@ def capsule_capsule(
     elif x2 < -1.0:
       x2 = -1.0
       x1 = wp.clamp((u + mb) / ma, -1.0, 1.0)
+
+    if ADJ_PARALLEL == 1:  # x1, x2 unchanged; their adjoint dropped where frozen (patch 0002)
+      x1 = _segment_param(x1, frozen)
+      x2 = _segment_param(x2, frozen)
 
     # find nearest points
     vec1 = cap1_pos + axis1 * x1
