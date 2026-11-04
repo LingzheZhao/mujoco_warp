@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
+# Modified from the pinned adjoint source: COM-only range-sum backport of upstream PR #1872
+# with subtree-size metadata from #1730; retains the old nonzero-mass division rule.
 
 
 import warp as wp
@@ -684,50 +686,60 @@ def flex(m: Model, d: Data):
 
 
 @wp.kernel
-def _subtree_com_init(
+def _subtree_com(
   # Model:
   body_mass: wp.array2d[float],
+  body_subtreemass: wp.array2d[float],
+  body_subtreenum: wp.array[int],
   # Data in:
   xipos_in: wp.array2d[wp.vec3],
   # Data out:
   subtree_com_out: wp.array2d[wp.vec3],
 ):
+  """Mass-weighted com of the subtree, the contiguous body range [b, b + body_subtreenum[b])."""
   worldid, bodyid = wp.tid()
-  subtree_com_out[worldid, bodyid] = xipos_in[worldid, bodyid] * body_mass[worldid % body_mass.shape[0], bodyid]
+  if bodyid == 0:  # summed from the tree roots in _subtree_com_world
+    return
+  mass_id = worldid % body_mass.shape[0]
 
+  com = wp.vec3(0.0)
+  for j in range(bodyid, bodyid + body_subtreenum[bodyid]):
+    com += xipos_in[worldid, j] * body_mass[mass_id, j]
 
-@wp.kernel
-def _subtree_com_acc(
-  # Model:
-  body_parentid: wp.array[int],
-  # Data in:
-  subtree_com_in: wp.array2d[wp.vec3],
-  # In:
-  body_tree_: wp.array[int],
-  # Data out:
-  subtree_com_out: wp.array2d[wp.vec3],
-):
-  worldid, nodeid = wp.tid()
-  bodyid = body_tree_[nodeid]
-  pid = body_parentid[bodyid]
-  if bodyid != 0:
-    wp.atomic_add(subtree_com_out, worldid, pid, subtree_com_in[worldid, bodyid])
-
-
-@wp.kernel
-def _subtree_div(
-  # Model:
-  body_subtreemass: wp.array2d[float],
-  # Data in:
-  subtree_com_in: wp.array2d[wp.vec3],
-  # Data out:
-  subtree_com_out: wp.array2d[wp.vec3],
-):
-  worldid, bodyid = wp.tid()
-  com = subtree_com_in[worldid, bodyid]
   mass = body_subtreemass[worldid % body_subtreemass.shape[0], bodyid]
+  # Preserve this pinned version's zero-mass behavior: retain the weighted sum.
   if mass != 0.0:
-    subtree_com_out[worldid, bodyid] = com / mass
+    com /= mass
+  subtree_com_out[worldid, bodyid] = com
+
+
+@wp.kernel
+def _subtree_com_world(
+  # Model:
+  nbody: int,
+  body_mass: wp.array2d[float],
+  body_subtreemass: wp.array2d[float],
+  body_subtreenum: wp.array[int],
+  # Data in:
+  xipos_in: wp.array2d[wp.vec3],
+  subtree_com_in: wp.array2d[wp.vec3],
+  # Data out:
+  subtree_com_out: wp.array2d[wp.vec3],
+):
+  worldid = wp.tid()
+  subtreemass_id = worldid % body_subtreemass.shape[0]
+
+  com = xipos_in[worldid, 0] * body_mass[worldid % body_mass.shape[0], 0]
+  rootid = int(1)
+  while rootid < nbody:
+    com += subtree_com_in[worldid, rootid] * body_subtreemass[subtreemass_id, rootid]
+    rootid += body_subtreenum[rootid]
+
+  mass = body_subtreemass[subtreemass_id, 0]
+  # Preserve this pinned version's zero-mass behavior: retain the weighted sum.
+  if mass != 0.0:
+    com /= mass
+  subtree_com_out[worldid, 0] = com
 
 
 @wp.kernel
@@ -825,22 +837,22 @@ def _cdof(
 def com_pos(m: Model, d: Data):
   """Computes subtree center of mass positions.
 
-  Transforms inertia and motion to global frame centered at subtree CoM. Accumulates the
-  mass-weighted positions up the kinematic tree, divides by total mass, and computes composite
+  Transforms inertia and motion to global frame centered at subtree CoM. Sums each subtree's
+  mass-weighted positions in body order, divides by nonzero total mass, and computes composite
   inertias and motion degrees of freedom in the subtree CoM frame.
   """
-  wp.launch(_subtree_com_init, dim=(d.nworld, m.nbody), inputs=[m.body_mass, d.xipos], outputs=[d.subtree_com])
-
-  for i in reversed(range(len(m.body_tree))):
-    body_tree = m.body_tree[i]
-    wp.launch(
-      _subtree_com_acc,
-      dim=(d.nworld, body_tree.size),
-      inputs=[m.body_parentid, d.subtree_com, body_tree],
-      outputs=[d.subtree_com],
-    )
-
-  wp.launch(_subtree_div, dim=(d.nworld, m.nbody), inputs=[m.body_subtreemass, d.subtree_com], outputs=[d.subtree_com])
+  wp.launch(
+    _subtree_com,
+    dim=(d.nworld, m.nbody),
+    inputs=[m.body_mass, m.body_subtreemass, m.body_subtreenum, d.xipos],
+    outputs=[d.subtree_com],
+  )
+  wp.launch(
+    _subtree_com_world,
+    dim=d.nworld,
+    inputs=[m.nbody, m.body_mass, m.body_subtreemass, m.body_subtreenum, d.xipos, d.subtree_com],
+    outputs=[d.subtree_com],
+  )
   wp.launch(
     _cinert,
     dim=(d.nworld, m.nbody),

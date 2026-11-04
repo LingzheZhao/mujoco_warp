@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
+# Modified from the pinned adjoint source: COM-only range-sum backport of upstream PR #1872
+# with subtree-size metadata from #1730; retains the old nonzero-mass division rule.
 
 import dataclasses
 import warnings
@@ -454,6 +456,11 @@ def put_model(mjm: mujoco.MjModel, batch_sizes: dict[str, int] | None = None) ->
     body_depth[i] = body_depth[mjm.body_parentid[i]] + 1
     bodies.setdefault(body_depth[i], []).append(i)
   m.body_tree = tuple(wp.array(bodies[i], dtype=int) for i in sorted(bodies))
+
+  # Subtree sizes include the body itself; parents precede their descendants.
+  m.body_subtreenum = np.ones(mjm.nbody, dtype=np.int32)
+  for i in reversed(range(1, mjm.nbody)):
+    m.body_subtreenum[mjm.body_parentid[i]] += m.body_subtreenum[i]
 
   # branch-based traversal data
   children_count = np.bincount(mjm.body_parentid[1:], minlength=mjm.nbody)
