@@ -3222,6 +3222,160 @@ def solve_m(m: Model, d: Data, x: wp.array2d[float], y: wp.array2d[float]):
 
 
 @cache_kernel
+def _small_cholesky_solve_block_multiple_rhs(block_size: int):
+  @wp.kernel(module="unique", enable_backward=False)
+  def kernel(
+    qLD_block_adr: wp.array[int],
+    block_dof: wp.array[int],
+    D_in: wp.array2d[float],
+    L_in: wp.array2d[float],
+    y_in: wp.array3d[float],
+    x_out: wp.array3d[float],
+  ):
+    worldid, blk, rhsid = wp.tid()
+    start = block_dof[blk]
+    size = wp.static(block_size)
+    factor_adr = qLD_block_adr[start]
+    if factor_adr == Q_LD_BLOCK_COMPACT:
+      for i in range(wp.static(block_size)):
+        x_out[worldid, rhsid, start + i] = D_in[worldid, start + i] * y_in[worldid, rhsid, start + i]
+    else:
+      for i in range(size):
+        value = y_in[worldid, rhsid, start + i]
+        for k in range(i):
+          value -= L_in[worldid, factor_adr + k * size + i] * x_out[worldid, rhsid, start + k]
+        x_out[worldid, rhsid, start + i] = value / L_in[worldid, factor_adr + i * size + i]
+
+      for reverse_i in range(size):
+        i = size - 1 - reverse_i
+        value = x_out[worldid, rhsid, start + i]
+        for k in range(i + 1, size):
+          value -= L_in[worldid, factor_adr + i * size + k] * x_out[worldid, rhsid, start + k]
+        x_out[worldid, rhsid, start + i] = value / L_in[worldid, factor_adr + i * size + i]
+
+  return kernel
+
+
+@cache_kernel
+def _tile_cholesky_solve_block_multiple_rhs(tile: TileSet):
+  block_size = tile.size
+  block_area = block_size * block_size
+
+  @wp.kernel(module="unique", enable_backward=False)
+  def kernel(
+    qLD_block_adr: wp.array[int],
+    block_dof: wp.array[int],
+    L_in: wp.array2d[float],
+    y: wp.array3d[float],
+    x: wp.array3d[float],
+  ):
+    worldid, blk, rhsid = wp.tid()
+    start = block_dof[blk]
+    L = wp.tile_reshape(
+      wp.tile_load(L_in[worldid], shape=(block_area,), offset=(qLD_block_adr[start],)), (block_size, block_size)
+    )
+    rhs = wp.tile_load(y[worldid, rhsid], shape=(block_size,), offset=(start,))
+    sol = wp.tile_cholesky_solve(L, rhs, fill_mode="upper")
+    wp.tile_store(x[worldid, rhsid], sol, offset=(start,))
+
+  return kernel
+
+
+@cache_kernel
+def _solve_LD_sparse_fused_multiple_rhs(nv: int, nlevels: int):
+  @wp.func_native(snippet="WP_TILE_SYNC();")
+  def _syncthreads():
+    pass
+
+  @wp.kernel(module="unique", enable_backward=False)
+  def kernel(
+    qLD_block_adr: wp.array[int],
+    L: wp.array2d[float],
+    D: wp.array2d[float],
+    all_updates: wp.array[wp.vec3i],
+    level_offsets: wp.array[int],
+    y: wp.array3d[float],
+    x_out: wp.array3d[float],
+  ):
+    world_rhsid, tid = wp.tid()
+    worldid = world_rhsid // y.shape[1]
+    rhsid = world_rhsid % y.shape[1]
+    NV = wp.static(nv)
+    NLEVELS = wp.static(nlevels)
+    BLOCK_DIM = wp.block_dim()
+
+    for dofid in range(tid, NV, BLOCK_DIM):
+      if qLD_block_adr[dofid] == Q_LD_BLOCK_SPARSE:
+        x_out[worldid, rhsid, dofid] = y[worldid, rhsid, dofid]
+    _syncthreads()
+
+    for level in range(NLEVELS):
+      level_idx = NLEVELS - 1 - level
+      level_offset = level_offsets[level_idx]
+      level_size = level_offsets[level_idx + 1] - level_offset
+      for u in range(tid, level_size, BLOCK_DIM):
+        update = all_updates[level_offset + u]
+        i, k, Madr_ki = update[0], update[1], update[2]
+        wp.atomic_sub(x_out[worldid, rhsid], i, L[worldid, Madr_ki] * x_out[worldid, rhsid, k])
+      _syncthreads()
+
+    for dofid in range(tid, NV, BLOCK_DIM):
+      if qLD_block_adr[dofid] == Q_LD_BLOCK_SPARSE:
+        x_out[worldid, rhsid, dofid] *= D[worldid, dofid]
+    _syncthreads()
+
+    for level in range(NLEVELS):
+      level_idx = level
+      level_offset = level_offsets[level_idx]
+      level_size = level_offsets[level_idx + 1] - level_offset
+      for u in range(tid, level_size, BLOCK_DIM):
+        update = all_updates[level_offset + u]
+        i, k, Madr_ki = update[0], update[1], update[2]
+        wp.atomic_sub(x_out[worldid, rhsid], k, L[worldid, Madr_ki] * x_out[worldid, rhsid, i])
+      _syncthreads()
+
+  return kernel
+
+
+@event_scope
+def solve_m_multiple_rhs(m: Model, d: Data, x: wp.array3d[float], y: wp.array3d[float]):
+  """Solve independent right-hand sides using the current inertia factorization.
+
+  Arrays have shape (nworld, nrhs, nv). Each right-hand side retains the scalar
+  solver's arithmetic and reads the existing qLD/qLDiagInv for its world. Input
+  and output may alias, as in solve_m. No factorization is recomputed and no
+  additional right-hand-side transport is introduced.
+  """
+  for tile in m.M_tiles:
+    if tile.elemid.size == 0:
+      wp.launch(
+        _small_cholesky_solve_block_multiple_rhs(tile.size),
+        dim=(d.nworld, tile.adr.size, y.shape[1]),
+        inputs=[m.qLD_block_adr, tile.adr, d.qLDiagInv, d.qLD, y],
+        outputs=[x],
+        block_dim=m.block_dim.small_cholesky,
+      )
+    else:
+      block_dim = m.block_dim.cholesky_solve if tile.size <= 40 else 32
+      wp.launch_tiled(
+        _tile_cholesky_solve_block_multiple_rhs(tile),
+        dim=(d.nworld, tile.adr.size, y.shape[1]),
+        inputs=[m.qLD_block_adr, tile.adr, d.qLD, y],
+        outputs=[x],
+        block_dim=block_dim,
+      )
+  if d.qLD.shape[1] > m.qLD_block_total:
+    dim_block = m.block_dim.solve_LD_sparse_fused if wp.get_device().is_cuda else 1
+    wp.launch(
+      _solve_LD_sparse_fused_multiple_rhs(m.nv, len(m.qLD_updates)),
+      dim=(d.nworld * y.shape[1], dim_block),
+      inputs=[m.qLD_block_adr, d.qLD[:, m.qLD_block_total :], d.qLDiagInv, m.qLD_all_updates, m.qLD_level_offsets, y],
+      outputs=[x],
+      block_dim=dim_block,
+    )
+
+
+@cache_kernel
 def _tile_cholesky_factorize_solve_block(tile: TileSet):
   # Fused factor+solve: densify the block, factor it, and back-substitute in one launch (avoids
   # re-loading the factor). Grid/densify structure matches _tile_cholesky_factorize_block.

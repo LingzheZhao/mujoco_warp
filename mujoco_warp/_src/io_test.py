@@ -1779,6 +1779,57 @@ class IOTest(parameterized.TestCase):
     expected = np.stack([np.linalg.solve(dense[worldid], np.ones(m.nv)) for worldid in range(2)])
     np.testing.assert_allclose(result.numpy(), expected, atol=1e-5)
 
+  def test_set_const_body_invweight0_per_world(self):
+    """Batched body rows preserve independent COMs, fixed bodies and ancestor offsets."""
+    mjm, mjd, m, d = test_data.fixture(
+      xml="""
+      <mujoco>
+        <worldbody>
+          <body name="fixed"><geom type="sphere" size=".1"/></body>
+          <body name="root" pos="0 0 1">
+            <freejoint/>
+            <geom type="sphere" size=".1" pos=".2 .3 .4"/>
+            <body name="hinged" pos=".3 0 0">
+              <joint axis="0 1 0" armature=".1"/>
+              <geom type="capsule" size=".03 .1"/>
+              <body name="tip" pos=".1 .2 0"><geom type="sphere" size=".04"/></body>
+            </body>
+          </body>
+          <body name="independent" pos="2 0 1">
+            <joint axis="1 0 0" armature=".1"/>
+            <geom type="sphere" size=".1"/>
+          </body>
+        </worldbody>
+      </mujoco>
+      """,
+      nworld=3,
+    )
+    self.assertTrue(any(tile.elemid.size > 0 for tile in m.M_tiles))
+    body_ipos = np.tile(mjm.body_ipos, (d.nworld, 1, 1))
+    root = mujoco.mj_name2id(mjm, mujoco.mjtObj.mjOBJ_BODY, "root")
+    tip = mujoco.mj_name2id(mjm, mujoco.mjtObj.mjOBJ_BODY, "tip")
+    body_ipos[1, root] += (0.05, -0.02, 0.03)
+    body_ipos[2, tip] += (-0.04, 0.03, 0.02)
+    m.body_ipos = wp.array(body_ipos, dtype=wp.vec3)
+    m.body_invweight0 = wp.array(np.tile(mjm.body_invweight0, (d.nworld, 1, 1)), dtype=wp.vec2)
+    m.dof_invweight0 = wp.array(np.tile(mjm.dof_invweight0, (d.nworld, 1)), dtype=float)
+    saved_qpos = d.qpos.numpy().copy()
+
+    mjwarp.set_const(m, d)
+    actual = m.body_invweight0.numpy()
+    expected = []
+    for world in range(d.nworld):
+      mjm.body_ipos[:] = body_ipos[world]
+      mujoco.mj_setConst(mjm, mjd)
+      expected.append(mjm.body_invweight0.copy())
+      _assert_eq(m.dof_invweight0.numpy()[world], mjm.dof_invweight0, "dof_invweight0")
+    _assert_eq(actual, np.stack(expected), "per-world body_invweight0")
+    np.testing.assert_array_equal(d.qpos.numpy(), saved_qpos)
+    fixed = mujoco.mj_name2id(mjm, mujoco.mjtObj.mjOBJ_BODY, "fixed")
+    np.testing.assert_array_equal(actual[:, fixed], 0.0)
+    self.assertGreater(np.max(np.abs(actual[0] - actual[1])), 1e-5)
+    self.assertGreater(np.max(np.abs(actual[0] - actual[2])), 1e-5)
+
   def test_set_const_balljoint(self):
     """Test set_const with ball joint (3 DOFs with averaging)."""
     mjm, mjd, m, d = test_data.fixture(

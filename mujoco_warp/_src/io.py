@@ -3174,10 +3174,9 @@ def _finalize_dof_invweight0(
 
 
 @wp.kernel
-def _compute_body_jac_row(
+def _compute_body_jac_rows(
   nv: int,
   bodyid_target: int,
-  row_idx: int,
   body_parentid: wp.array[int],
   body_rootid: wp.array[int],
   body_dofadr: wp.array[int],
@@ -3186,12 +3185,12 @@ def _compute_body_jac_row(
   subtree_com_in: wp.array2d[wp.vec3],
   xipos_in: wp.array2d[wp.vec3],
   cdof_in: wp.array2d[wp.spatial_vector],
-  body_jac_row_out: wp.array2d[float],
+  body_jac_row_out: wp.array3d[float],
 ):
-  worldid = wp.tid()
+  worldid, row_idx = wp.tid()
 
   for i in range(nv):
-    body_jac_row_out[worldid, i] = 0.0
+    body_jac_row_out[worldid, row_idx, i] = 0.0
 
   bodyid = bodyid_target
   while bodyid > 0 and body_dofnum[bodyid] == 0:
@@ -3216,37 +3215,36 @@ def _compute_body_jac_row(
     if row_idx < 3:
       tmp = wp.cross(cdof_ang, offset)
       if row_idx == 0:
-        body_jac_row_out[worldid, dofid] = cdof_lin[0] + tmp[0]
+        body_jac_row_out[worldid, row_idx, dofid] = cdof_lin[0] + tmp[0]
       elif row_idx == 1:
-        body_jac_row_out[worldid, dofid] = cdof_lin[1] + tmp[1]
+        body_jac_row_out[worldid, row_idx, dofid] = cdof_lin[1] + tmp[1]
       else:
-        body_jac_row_out[worldid, dofid] = cdof_lin[2] + tmp[2]
+        body_jac_row_out[worldid, row_idx, dofid] = cdof_lin[2] + tmp[2]
     else:
       if row_idx == 3:
-        body_jac_row_out[worldid, dofid] = cdof_ang[0]
+        body_jac_row_out[worldid, row_idx, dofid] = cdof_ang[0]
       elif row_idx == 4:
-        body_jac_row_out[worldid, dofid] = cdof_ang[1]
+        body_jac_row_out[worldid, row_idx, dofid] = cdof_ang[1]
       else:
-        body_jac_row_out[worldid, dofid] = cdof_ang[2]
+        body_jac_row_out[worldid, row_idx, dofid] = cdof_ang[2]
 
     dofid = dof_parentid[dofid]
 
 
 @wp.kernel
-def _compute_body_A_diag_entry(
+def _compute_body_A_diag_entries(
   nv: int,
   bodyid_target: int,
-  row_idx: int,
-  body_jac_row_in: wp.array2d[float],
-  result_vec_in: wp.array2d[float],
+  body_jac_row_in: wp.array3d[float],
+  result_vec_in: wp.array3d[float],
   body_A_diag_out: wp.array3d[float],
 ):
-  worldid = wp.tid()
+  worldid, row_idx = wp.tid()
   body_A_diag_id = worldid % body_A_diag_out.shape[0]
   # A[row,row] = J[row] · inv(M) · J[row]' = J[row] · result_vec
   dot_prod = float(0.0)
   for i in range(nv):
-    dot_prod += body_jac_row_in[worldid, i] * result_vec_in[worldid, i]
+    dot_prod += body_jac_row_in[worldid, row_idx, i] * result_vec_in[worldid, row_idx, i]
   body_A_diag_out[body_A_diag_id, bodyid_target, row_idx] = dot_prod
 
 
@@ -3623,38 +3621,38 @@ def set_const_0(m: types.Model, d: types.Data, restore: bool = True):
   # body_invweight0: computed as mean diagonal of J * inv(M) * J'
   # where J is the 6xnv body Jacobian (3 rows translation, 3 rows rotation)
   if m.nv > 0:
-    body_jac_row = wp.zeros((d.nworld, m.nv), dtype=float)
-    body_result_vec = wp.zeros((d.nworld, m.nv), dtype=float)
+    # Six independent Jacobian right-hand sides share the existing factorization.
+    # Allocate once per refresh and reuse for every body; each producer overwrites
+    # all DOFs, including nonancestor entries and static-body rows.
+    body_jac_rows = wp.zeros((d.nworld, 6, m.nv), dtype=float)
+    body_result_vecs = wp.zeros((d.nworld, 6, m.nv), dtype=float)
     body_A_diag = wp.zeros((d.nworld, m.nbody, 6), dtype=float)
 
-    # TODO(team): more efficient approach instead of nested iterations?
     for bodyid in range(1, m.nbody):
-      for row_idx in range(6):
-        wp.launch(
-          _compute_body_jac_row,
-          dim=d.nworld,
-          inputs=[
-            m.nv,
-            bodyid,
-            row_idx,
-            m.body_parentid,
-            m.body_rootid,
-            m.body_dofadr,
-            m.body_dofnum,
-            m.dof_parentid,
-            d.subtree_com,
-            d.xipos,
-            d.cdof,
-          ],
-          outputs=[body_jac_row],
-        )
-        smooth.solve_m(m, d, body_result_vec, body_jac_row)
-        wp.launch(
-          _compute_body_A_diag_entry,
-          dim=d.nworld,
-          inputs=[m.nv, bodyid, row_idx, body_jac_row, body_result_vec],
-          outputs=[body_A_diag],
-        )
+      wp.launch(
+        _compute_body_jac_rows,
+        dim=(d.nworld, 6),
+        inputs=[
+          m.nv,
+          bodyid,
+          m.body_parentid,
+          m.body_rootid,
+          m.body_dofadr,
+          m.body_dofnum,
+          m.dof_parentid,
+          d.subtree_com,
+          d.xipos,
+          d.cdof,
+        ],
+        outputs=[body_jac_rows],
+      )
+      smooth.solve_m_multiple_rhs(m, d, body_result_vecs, body_jac_rows)
+      wp.launch(
+        _compute_body_A_diag_entries,
+        dim=(d.nworld, 6),
+        inputs=[m.nv, bodyid, body_jac_rows, body_result_vecs],
+        outputs=[body_A_diag],
+      )
 
     wp.launch(
       _finalize_body_invweight0,
