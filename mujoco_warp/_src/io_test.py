@@ -1797,7 +1797,7 @@ class IOTest(parameterized.TestCase):
           </body>
           <body name="independent" pos="2 0 1">
             <joint axis="1 0 0" armature=".1"/>
-            <geom type="sphere" size=".1"/>
+            <geom type="sphere" size=".1" pos=".1 .2 .3"/>
           </body>
         </worldbody>
       </mujoco>
@@ -1815,6 +1815,7 @@ class IOTest(parameterized.TestCase):
     m.dof_invweight0 = wp.array(np.tile(mjm.dof_invweight0, (d.nworld, 1)), dtype=float)
     saved_qpos = d.qpos.numpy().copy()
 
+    # The independent COM is off-axis so both inverse weights are nonzero for the CPU comparison.
     mjwarp.set_const(m, d)
     actual = m.body_invweight0.numpy()
     expected = []

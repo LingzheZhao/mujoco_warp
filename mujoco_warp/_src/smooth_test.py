@@ -657,6 +657,7 @@ class SmoothTest(parameterized.TestCase):
   )
   def test_solve_m_multiple_rhs_mixed_blocks(self, inplace, tile_size):
     """Independent RHS use each world's live compact, scalar, tiled and sparse factors."""
+
     def hinge_chain(count):
       body = '<body pos="0 0 .05"><joint axis="0 1 0" armature="1"/><geom type="capsule" size=".02 .025"/>'
       return body * count + "</body>" * count

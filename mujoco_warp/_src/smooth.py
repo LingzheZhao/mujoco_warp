@@ -3225,11 +3225,14 @@ def solve_m(m: Model, d: Data, x: wp.array2d[float], y: wp.array2d[float]):
 def _small_cholesky_solve_block_multiple_rhs(block_size: int):
   @wp.kernel(module="unique", enable_backward=False)
   def kernel(
+    # Model:
     qLD_block_adr: wp.array[int],
+    # In:
     block_dof: wp.array[int],
     D_in: wp.array2d[float],
     L_in: wp.array2d[float],
     y_in: wp.array3d[float],
+    # Out:
     x_out: wp.array3d[float],
   ):
     worldid, blk, rhsid = wp.tid()
@@ -3263,10 +3266,13 @@ def _tile_cholesky_solve_block_multiple_rhs(tile: TileSet):
 
   @wp.kernel(module="unique", enable_backward=False)
   def kernel(
+    # Model:
     qLD_block_adr: wp.array[int],
+    # In:
     block_dof: wp.array[int],
     L_in: wp.array2d[float],
     y: wp.array3d[float],
+    # Out:
     x: wp.array3d[float],
   ):
     worldid, blk, rhsid = wp.tid()
@@ -3289,12 +3295,15 @@ def _solve_LD_sparse_fused_multiple_rhs(nv: int, nlevels: int):
 
   @wp.kernel(module="unique", enable_backward=False)
   def kernel(
+    # Model:
     qLD_block_adr: wp.array[int],
+    # In:
     L: wp.array2d[float],
     D: wp.array2d[float],
     all_updates: wp.array[wp.vec3i],
     level_offsets: wp.array[int],
     y: wp.array3d[float],
+    # Out:
     x_out: wp.array3d[float],
   ):
     world_rhsid, tid = wp.tid()
