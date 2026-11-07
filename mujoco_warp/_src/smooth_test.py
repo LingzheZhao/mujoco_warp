@@ -652,8 +652,8 @@ class SmoothTest(parameterized.TestCase):
   @parameterized.named_parameters(
     ("separate", False, 7),
     ("inplace", True, 7),
-    ("production_tile", False, 35),
-    ("large_tile", False, 64),
+    ("tile_35", False, 35),
+    ("tile_64", False, 64),
   )
   def test_solve_m_multiple_rhs_mixed_blocks(self, inplace, tile_size):
     """Independent RHS use each world's live compact, scalar, tiled and sparse factors."""
