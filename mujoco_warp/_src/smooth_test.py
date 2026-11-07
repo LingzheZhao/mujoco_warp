@@ -649,6 +649,78 @@ class SmoothTest(parameterized.TestCase):
     mjw.solve_m(m, d, res, d.qfrc_smooth)
     _assert_eq(res.numpy()[0], ref[0], "M \\ qfrc_smooth (mixed blocks)")
 
+  @parameterized.named_parameters(
+    ("separate", False, 7),
+    ("inplace", True, 7),
+    ("tile_35", False, 35),
+    ("tile_64", False, 64),
+  )
+  def test_solve_m_multiple_rhs_mixed_blocks(self, inplace, tile_size):
+    """Independent RHS use each world's live compact, scalar, tiled and sparse factors."""
+
+    def hinge_chain(count):
+      body = '<body pos="0 0 .05"><joint axis="0 1 0" armature="1"/><geom type="capsule" size=".02 .025"/>'
+      return body * count + "</body>" * count
+
+    # Different trees exercise all factor layouts in the same qLD allocation.
+    # The centered free body is compact; the offset free body shares its scalar
+    # tile group but requires a full factor.
+    chains = "".join(f'<body pos="{i} 0 1">{hinge_chain(count)}</body>' for i, count in enumerate((70, 6, tile_size)))
+    free = """
+      <body pos="3 0 1"><freejoint/><geom type="sphere" size=".1"/></body>
+      <body pos="4 0 1"><freejoint/><geom type="sphere" size=".1" pos=".2 .3 .4"/></body>
+    """
+    mjm, _, m, d = test_data.fixture(xml=f"<mujoco><worldbody>{chains}{free}</worldbody></mujoco>", nworld=3)
+    self.assertTrue(any(tile.elemid.size == 0 for tile in m.M_tiles))
+    self.assertTrue(any(tile.elemid.size > 0 for tile in m.M_tiles))
+    self.assertTrue(np.any(m.qLD_block_adr.numpy() == types.Q_LD_BLOCK_COMPACT))
+    self.assertGreater(d.qLD.shape[1], m.qLD_block_total)
+
+    matrix_values = d.M.numpy().copy()
+    rhs_values = np.random.default_rng(0).standard_normal((d.nworld, 6, m.nv)).astype(np.float32)
+    previous_result = None
+    previous_factors = None
+    # Refactor with different per-world values on the second call. A cached
+    # factor binding or a wrong world index must not satisfy both solves.
+    for scales in ((0.75, 1.0, 1.25), (1.125, 0.875, 1.5)):
+      if previous_factors is not None:
+        d.qLD = wp.empty_like(d.qLD)
+        d.qLDiagInv = wp.empty_like(d.qLDiagInv)
+        self.assertNotEqual(d.qLD.ptr, previous_factors[0].ptr)
+        self.assertNotEqual(d.qLDiagInv.ptr, previous_factors[1].ptr)
+      d.M.assign(matrix_values * np.asarray(scales, dtype=np.float32)[:, None])
+      mjw.factor_m(m, d)
+      factors = d.qLD.numpy().copy(), d.qLDiagInv.numpy().copy()
+      dense = np.zeros((d.nworld, m.nv, m.nv))
+      for world in range(d.nworld):
+        mujoco.mju_sym2dense(dense[world], d.M.numpy()[world], mjm.M_rownnz, mjm.M_rowadr, mjm.M_colind)
+      expected = np.stack([np.linalg.solve(matrix, rhs.T).T for matrix, rhs in zip(dense, rhs_values)])
+
+      scalar = []
+      for rhs in range(rhs_values.shape[1]):
+        vector = wp.array(rhs_values[:, rhs].copy(), dtype=float)
+        result = wp.empty_like(vector)
+        mjw.solve_m(m, d, result, vector)
+        scalar.append(result.numpy())
+
+      rhs = wp.array(rhs_values, dtype=float)
+      result = rhs if inplace else wp.empty_like(rhs)
+      if not inplace:
+        result.fill_(float("nan"))
+      mjw._src.smooth.solve_m_multiple_rhs(m, d, result, rhs)
+      actual = result.numpy()
+      self.assertTrue(np.isfinite(actual).all())
+      _assert_eq(actual, np.stack(scalar, axis=1), "multiple RHS versus scalar solves")
+      _assert_eq(actual, expected, "multiple RHS versus dense solve")
+      np.testing.assert_array_equal(d.qLD.numpy(), factors[0])
+      np.testing.assert_array_equal(d.qLDiagInv.numpy(), factors[1])
+      if not inplace:
+        np.testing.assert_array_equal(rhs.numpy(), rhs_values)
+      if previous_result is not None:
+        self.assertFalse(np.array_equal(actual, previous_result))
+      previous_result = actual
+      previous_factors = d.qLD, d.qLDiagInv
+
   def test_factor_solve_lu(self):
     """Tests factor_solve_lu with a sparse matrix representing a tree."""
     xml = """
